@@ -216,7 +216,48 @@ static void test_interval_flush_and_session_rotation() {
     CHECK(sid(env.http.calls[1].body) != s1);
 }
 
+static void test_nested_values() {
+    std::string j;
+    lucida::detail::json_props(j, {{"cart", lucida::Object{{"items", lucida::List{int64_t(1), std::string("a\"b"), nullptr}}, {"ok", true}}},
+                                   {"n", 7}, {"s", "lit"}});
+    CHECK(j == "{\"cart\":{\"items\":[1,\"a\\\"b\",null],\"ok\":true},\"n\":7,\"s\":\"lit\"}");
+    lucida::Value deep = int64_t(1);
+    for (int i = 0; i < 40; i++) deep = lucida::List{deep};
+    std::string d;
+    lucida::detail::json_value(d, deep);
+    CHECK(d.find("null") != std::string::npos && d.size() < 100); // cut at kMaxDepth
+}
+
+static void test_queue_survives_restart() {
+    Env env;
+    {
+        lucida::Client c(env.cfg(), env.http, env.store);
+        c.capture("offline_1");
+        c.capture("offline_2");
+        env.http.script = {0};
+        c.flush(); // network down: the events stay queued, and stored
+        CHECK(c.queued() == 2);
+    } // the process "dies" here
+    lucida::Client again(env.cfg(), env.http, env.store);
+    CHECK(again.queued() == 2);
+    again.flush();
+    CHECK(has(env.http.calls.back().body, "\"event\":\"offline_1\"") && has(env.http.calls.back().body, "\"event\":\"offline_2\""));
+    CHECK(again.queued() == 0 && env.store.get("lucida.queue").empty());
+    // opt-in mode stores nothing before consent; opting out erases what was stored
+    Env gated;
+    lucida::Client g(gated.cfg(lucida::ConsentMode::OptIn), gated.http, gated.store);
+    g.opt_in();
+    g.capture("x");
+    gated.http.script = {0};
+    g.flush();
+    CHECK(!gated.store.get("lucida.queue").empty());
+    g.opt_out();
+    CHECK(gated.store.get("lucida.queue").empty());
+}
+
 int main() {
+    test_nested_values();
+    test_queue_survives_restart();
     test_helpers();
     test_event_shape_and_batch();
     test_opt_in_gates_capture_and_storage();

@@ -24,10 +24,10 @@ client.tick();
 
 - Events go to `POST /v1/batch` (20 events or 5 s, at most 100 per request, one batch in flight), each with a
   uuid v7 for dedupe. 408, 429, 5xx and network failures retry with exponential backoff and jitter (5 tries);
-  other 4xx drop the batch. The queue holds 1000 events (oldest dropped) in memory.
+  other 4xx drop the batch. The queue holds 1000 events (oldest dropped) and is mirrored to `Storage` once consent is held (`persist_queue`), so a restart resends it.
 - Identity (anon id, distinct id) and the consent decision go through `Storage` only once analytics consent is
   held; `opt_out()` sends `$opt_out`, forgets the identity and keeps only the refusal. `$lc_*` properties are dropped.
-- Property values are flat (null, bool, int64, double, string). No feature flags in this SDK yet.
+- Property values are JSON: null, bool, int64, double, string, and nested `lucida::List` / `lucida::Object` (16 levels). No feature flags in this SDK yet.
 
 Tests: `make -C sdks/cpp test` (clang++/clang; builds with `-fno-exceptions -fno-rtti -Werror`, the way Unreal
 compiles plugin code). `make -C sdks/cpp clean` removes `build/`.

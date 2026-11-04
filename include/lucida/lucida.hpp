@@ -15,14 +15,35 @@
 #include <mutex>
 #include <random>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
 
 namespace lucida {
 
-using Value = std::variant<std::nullptr_t, bool, int64_t, double, std::string>;
-// shortcut: flat property values only (no nested objects/arrays), add a JSON value type when a caller needs nesting.
+struct Value;
+using List = std::vector<Value>;
+using Object = std::vector<std::pair<std::string, Value>>; // insertion order is kept; a repeated key is sent as given
+
+/// A JSON value: null, bool, integer, double, string, or a nested list/object (nesting deeper than kMaxDepth is sent as null).
+struct Value {
+    static constexpr int kMaxDepth = 16;
+    std::variant<std::nullptr_t, bool, int64_t, double, std::string, List, Object> v;
+
+    Value() : v(nullptr) {}
+    Value(std::nullptr_t) : v(nullptr) {}
+    Value(bool b) : v(b) {}
+    template <class T, std::enable_if_t<std::is_integral_v<T> && !std::is_same_v<T, bool>, int> = 0>
+    Value(T i) : v(static_cast<int64_t>(i)) {}
+    template <class T, std::enable_if_t<std::is_floating_point_v<T>, int> = 0>
+    Value(T d) : v(static_cast<double>(d)) {}
+    Value(const char* s) : v(std::string(s ? s : "")) {}
+    Value(std::string s) : v(std::move(s)) {}
+    Value(List l) : v(std::move(l)) {}
+    Value(Object o) : v(std::move(o)) {}
+};
+
 using Props = std::map<std::string, Value>;
 
 /// Port: sends a POST. `done(status)` may run inline or later, exactly once; status 0 = network failure.
@@ -63,6 +84,9 @@ struct Config {
     int64_t flush_interval_ms = 5000;
     size_t max_queue = 1000;
     size_t max_batch = 100;
+    /// Keep unsent events in Storage (after consent) so a restart or crash resends them; written at flush, on tick and at shutdown.
+    bool persist_queue = true;
+    int64_t persist_interval_ms = 1000;
     int max_retries = 5;
     std::string lib = "lucida-cpp";
     std::string lib_version = "0.1.0";
@@ -96,8 +120,11 @@ inline void json_str(std::string& out, const std::string& s) {
     out += '"';
 }
 
-inline void json_value(std::string& out, const Value& v) {
-    if (std::holds_alternative<std::nullptr_t>(v)) {
+inline void json_props(std::string& out, const Props& p, int depth = 0);
+
+inline void json_value(std::string& out, const Value& val, int depth = 0) {
+    const auto& v = val.v;
+    if (std::holds_alternative<std::nullptr_t>(v) || depth > Value::kMaxDepth) {
         out += "null";
     } else if (const bool* b = std::get_if<bool>(&v)) {
         out += *b ? "true" : "false";
@@ -111,12 +138,28 @@ inline void json_value(std::string& out, const Value& v) {
             std::snprintf(buf, sizeof buf, "%.17g", *d);
             out += buf;
         }
+    } else if (const List* l = std::get_if<List>(&v)) {
+        out += '[';
+        for (size_t k = 0; k < l->size(); k++) {
+            if (k) out += ',';
+            json_value(out, (*l)[k], depth + 1);
+        }
+        out += ']';
+    } else if (const Object* o = std::get_if<Object>(&v)) {
+        out += '{';
+        for (size_t k = 0; k < o->size(); k++) {
+            if (k) out += ',';
+            json_str(out, (*o)[k].first);
+            out += ':';
+            json_value(out, (*o)[k].second, depth + 1);
+        }
+        out += '}';
     } else {
         json_str(out, std::get<std::string>(v));
     }
 }
 
-inline void json_props(std::string& out, const Props& p) {
+inline void json_props(std::string& out, const Props& p, int depth) {
     out += '{';
     bool first = true;
     for (const auto& kv : p) {
@@ -124,7 +167,7 @@ inline void json_props(std::string& out, const Props& p) {
         first = false;
         json_str(out, kv.first);
         out += ':';
-        json_value(out, kv.second);
+        json_value(out, kv.second, depth + 1);
     }
     out += '}';
 }
@@ -218,7 +261,8 @@ public:
         distinct_id_ = storage_.get("lucida.distinct_id");
         if (distinct_id_.empty()) distinct_id_ = anon_id_;
         identified_ = storage_.get("lucida.identified") == "1";
-        last_flush_ = cfg_.now_ms();
+        last_flush_ = last_persist_ = cfg_.now_ms();
+        if (consent_ && cfg_.persist_queue) load_queue();
         persist();
     }
 
@@ -276,6 +320,8 @@ public:
             storage_.remove("lucida.anon_id");
             storage_.remove("lucida.distinct_id");
             storage_.remove("lucida.identified");
+            storage_.remove("lucida.queue");
+            dirty_ = false;
             storage_.set("lucida.consent", "denied"); // the refusal itself is the one thing kept
         }
         flush();
@@ -312,6 +358,7 @@ public:
         {
             std::lock_guard<std::mutex> lock(mu_);
             const int64_t now = cfg_.now_ms();
+            if (dirty_ && now - last_persist_ >= cfg_.persist_interval_ms) persist_queue_locked();
             due = !queue_.empty() && in_flight_ == 0 &&
                   (retry_at_ != 0 ? now >= retry_at_ : now - last_flush_ >= cfg_.flush_interval_ms);
         }
@@ -339,6 +386,7 @@ public:
             }
             body += "]}";
             in_flight_ = n;
+            persist_queue_locked();
         }
         transport_.post(cfg_.host + "/v1/batch", body, [this, n](int status) { settle(n, status); });
     }
@@ -348,6 +396,7 @@ public:
         {
             std::lock_guard<std::mutex> lock(mu_);
             retry_at_ = 0;
+            persist_queue_locked();
         }
         flush();
     }
@@ -391,6 +440,7 @@ private:
                 queue_.erase(queue_.begin() + static_cast<std::ptrdiff_t>(in_flight_ < queue_.size() - 1 ? in_flight_ : queue_.size() - 1));
                 dropped_++;
             }
+            dirty_ = true;
             full = queue_.size() >= cfg_.flush_at;
         }
         if (full) flush();
@@ -417,6 +467,7 @@ private:
                 attempt_ = 0;
                 retry_at_ = 0;
             }
+            persist_queue_locked();
             more = retry_at_ == 0 && queue_.size() >= cfg_.flush_at;
         }
         if (more) flush();
@@ -425,6 +476,34 @@ private:
     void persist() {
         std::lock_guard<std::mutex> lock(mu_);
         persist_locked();
+    }
+
+    // One event per line: JSON strings escape newlines, so a line is always one whole event.
+    void persist_queue_locked() {
+        dirty_ = false;
+        last_persist_ = cfg_.now_ms();
+        if (!cfg_.persist_queue || !consent_) return;
+        if (queue_.empty()) {
+            storage_.remove("lucida.queue");
+            return;
+        }
+        std::string all;
+        for (const auto& e : queue_) {
+            all += e;
+            all += '\n';
+        }
+        storage_.set("lucida.queue", all);
+    }
+
+    void load_queue() {
+        const std::string saved = storage_.get("lucida.queue");
+        size_t at = 0;
+        while (at < saved.size() && queue_.size() < cfg_.max_queue) {
+            size_t nl = saved.find('\n', at);
+            if (nl == std::string::npos) nl = saved.size();
+            if (nl > at && saved[at] == '{' && saved[nl - 1] == '}') queue_.push_back(saved.substr(at, nl - at)); // a torn write is skipped
+            at = nl + 1;
+        }
     }
 
     // Nothing reaches Storage before analytics consent (opt_in mode keeps the anon id in memory only).
@@ -443,10 +522,10 @@ private:
     bool consent_ = false;
     bool identified_ = false;
     std::string anon_id_, distinct_id_, session_id_;
-    int64_t session_last_ = 0, last_flush_ = 0, retry_at_ = 0;
+    int64_t session_last_ = 0, last_flush_ = 0, retry_at_ = 0, last_persist_ = 0;
+    bool dirty_ = false;
     int attempt_ = 0;
     size_t in_flight_ = 0, dropped_ = 0;
-    // shortcut: unsent events live in memory only; persist the queue through Storage if games need offline replay of events.
     std::deque<std::string> queue_;
 };
 
