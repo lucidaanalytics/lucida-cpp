@@ -77,7 +77,7 @@ enum class ConsentMode { OptOut, OptIn };
 
 struct Config {
     std::string api_key;
-    std::string host = "https://app.lucida.dev";
+    std::string host = "https://capture.lucidace.com";
     /// OptOut (default): capture until opt_out(). OptIn: nothing is captured or stored before opt_in().
     ConsentMode consent = ConsentMode::OptOut;
     size_t flush_at = 20;

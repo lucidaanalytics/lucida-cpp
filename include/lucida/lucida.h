@@ -17,7 +17,7 @@ typedef void (*lucida_post_fn)(void *user, const char *url, const char *body, vo
 
 typedef struct lucida_options {
     const char *api_key;
-    const char *host;   /* NULL = https://app.lucida.dev */
+    const char *host;   /* NULL = https://capture.lucidace.com */
     int opt_in;         /* 1: nothing is captured or stored before lucida_opt_in() */
     lucida_post_fn post;
     /* Optional persistence (all three or none; NULL = memory only). `get` returns a malloc'd string

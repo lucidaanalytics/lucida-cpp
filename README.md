@@ -1,5 +1,10 @@
 # Lucida for C and C++
 
+## Install
+
+From GitHub, [lucidaanalytics/lucida-cpp](https://github.com/lucidaanalytics/lucida-cpp), release `v0.1.0`: download `lucida-cpp-v0.1.0.zip` from the [release page](https://github.com/lucidaanalytics/lucida-cpp/releases/tag/v0.1.0), unzip it, and add its `include/` directory to your include path (compile `src/lucida_c.cpp` too for the C API).
+
+
 Header-only C++17 client (`include/lucida/lucida.hpp`, no exceptions or RTTI needed) plus a C API
 (`include/lucida/lucida.h`, compile `src/lucida_c.cpp`). The Unreal plugin (`sdks/unreal`) is built on it.
 
