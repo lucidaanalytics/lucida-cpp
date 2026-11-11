@@ -51,6 +51,13 @@ class Transport {
 public:
     virtual ~Transport() = default;
     virtual void post(const std::string& url, const std::string& body, std::function<void(int)> done) = 0;
+    /// Optional: POST and hand back the response body (flag evaluation). `done(status, body)` exactly once; status 0 = network
+    /// failure. The default reports a network failure, so a transport that only implements post() simply gets no flags.
+    virtual void request(const std::string& url, const std::string& body, std::function<void(int, const std::string&)> done) {
+        (void)url;
+        (void)body;
+        done(0, std::string());
+    }
 };
 
 /// Port: string key/value persistence (a file, PlayerPrefs-like settings, a save game).
@@ -89,7 +96,7 @@ struct Config {
     int64_t persist_interval_ms = 1000;
     int max_retries = 5;
     std::string lib = "lucida-cpp";
-    std::string lib_version = "0.1.0";
+    std::string lib_version = "0.1.1";
     /// Extra properties on every event (e.g. $os, $app_version); `$lc_*` keys are dropped.
     Props super_props;
     std::function<int64_t()> now_ms;  // default: system clock
@@ -272,6 +279,38 @@ public:
     /// Queues an event; returns false when consent blocks it.
     bool capture(const std::string& event, const Props& props = {}) { return enqueue(event, props, {}, {}); }
 
+    /// `capture` with group membership (`$groups`: group type -> group key), which also scopes group-level analytics.
+    bool capture_in_groups(const std::string& event, const std::map<std::string, std::string>& groups, const Props& props = {}) {
+        return enqueue(event, props, {}, {}, std::string(), &groups);
+    }
+
+    /// Links `alias_id` to `target_id` (default: this client's current id) with a `$create_alias` event.
+    bool alias(const std::string& alias_id, const std::string& target_id = std::string()) {
+        if (alias_id.empty()) return false;
+        const std::string id = target_id.empty() ? distinct_id() : target_id;
+        return enqueue("$create_alias", {{"alias", alias_id}, {"distinct_id", id}}, {}, {}, id);
+    }
+
+    /// Sets properties on a group (`$groupidentify`). The event belongs to `owner_id` when given, else to the
+    /// group itself (`$<type>_<key>`), so it never creates or updates a person.
+    bool group_identify(const std::string& group_type, const std::string& group_key, const Props& props = {},
+                        const std::string& owner_id = std::string()) {
+        if (group_type.empty() || group_key.empty()) return false;
+        Object set;
+        for (const auto& kv : detail::strip_reserved(props)) set.emplace_back(kv.first, kv.second);
+        return enqueue("$groupidentify", {{"$group_type", group_type}, {"$group_key", group_key}, {"$group_set", Value(std::move(set))}}, {}, {},
+                       owner_id.empty() ? "$" + group_type + "_" + group_key : owner_id);
+    }
+
+    /// The anonymous id this client had before identify(), or "" while anonymous; flag evaluation sends it as `anon_distinct_id`.
+    std::string anon_distinct_id() const {
+        std::lock_guard<std::mutex> lock(mu_);
+        return identified_ ? anon_id_ : std::string();
+    }
+
+    const Config& config() const { return cfg_; }
+    Transport& transport() { return transport_; }
+
     bool screen(const std::string& name, Props props = {}) {
         props["$screen_name"] = name;
         return enqueue("$screen", props, {}, {});
@@ -402,7 +441,9 @@ public:
     }
 
 private:
-    bool enqueue(const std::string& event, const Props& props, const Props& set, const Props& set_once) {
+    /// `id_override` (when not empty) is the event's distinct id instead of the client's; `groups` adds `$groups`.
+    bool enqueue(const std::string& event, const Props& props, const Props& set, const Props& set_once,
+                 const std::string& id_override = std::string(), const std::map<std::string, std::string>* groups = nullptr) {
         bool full;
         {
             std::lock_guard<std::mutex> lock(mu_);
@@ -420,7 +461,7 @@ private:
             e += ",\"event\":";
             detail::json_str(e, event);
             e += ",\"distinct_id\":";
-            detail::json_str(e, distinct_id_);
+            detail::json_str(e, id_override.empty() ? distinct_id_ : id_override);
             e += ",\"timestamp\":";
             detail::json_str(e, detail::iso8601(now));
             e += ",\"properties\":";
@@ -432,6 +473,12 @@ private:
             if (!set_once.empty()) {
                 e += ",\"$set_once\":";
                 detail::json_props(e, detail::strip_reserved(set_once));
+            }
+            if (groups && !groups->empty()) {
+                Props g;
+                for (const auto& kv : *groups) g[kv.first] = kv.second;
+                e += ",\"$groups\":";
+                detail::json_props(e, g);
             }
             e += '}';
             queue_.push_back(std::move(e));
